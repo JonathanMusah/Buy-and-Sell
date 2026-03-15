@@ -8,6 +8,14 @@ build/
 coverage/
 *.tsbuildinfo
 
+# Runtime database and temp files
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Archives and local exports
+*.zip
+
 # Env files
 .env
 .env.*
