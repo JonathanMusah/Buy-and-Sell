@@ -4,6 +4,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const sqlite3 = require('sqlite3').verbose();
+const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
@@ -21,6 +22,7 @@ const config = {
   port: process.env.PORT || 5000,
   env: process.env.NODE_ENV || 'development',
   databasePath: process.env.DATABASE_PATH || './database.sqlite',
+  databaseUrl: process.env.DATABASE_URL || '',
   jwt: {
     secret: process.env.JWT_SECRET || 'dev-secret-change-me',
     refreshSecret: process.env.JWT_REFRESH_SECRET || 'dev-refresh-secret-change-me',
@@ -133,7 +135,7 @@ const authLimiter = rateLimit({
   keyGenerator: (req) => {
     // Rate limit by IP + email so different accounts aren't penalized together
     const email = req.body?.email || '';
-    return `${req.ip}-${email.toLowerCase()}`;
+    return `${rateLimit.ipKeyGenerator(req.ip)}-${email.toLowerCase()}`;
   },
 });
 
@@ -168,43 +170,91 @@ const upload = multer({
 });
 
 // ============= DATABASE =============
-const db = new sqlite3.Database(config.databasePath, (err) => {
-  if (err) {
-    console.error('Database connection error:', err);
-    process.exit(1);
+const isMySql = Boolean(config.databaseUrl);
+let db = null;
+let mysqlPool = null;
+
+function normalizeSql(sql) {
+  let normalized = sql;
+  if (isMySql && /^\s*(CREATE\s+TABLE|ALTER\s+TABLE)/i.test(normalized)) {
+    // Convert SQLite column declarations to MySQL-compatible equivalents.
+    normalized = normalized.replace(/\bTEXT\b/g, 'VARCHAR(255)');
+    normalized = normalized.replace(/(\b\w+)\s+VARCHAR\(255\)\s+DEFAULT\s+CURRENT_TIMESTAMP/gi, '$1 DATETIME DEFAULT CURRENT_TIMESTAMP');
+    normalized = normalized.replace(/(\b\w+At)\s+VARCHAR\(255\)\s+DEFAULT\s+CURRENT_TIMESTAMP/gi, '$1 DATETIME DEFAULT CURRENT_TIMESTAMP');
+    normalized = normalized.replace(/(\b\w+At)\s+VARCHAR\(255\)/gi, '$1 DATETIME');
+    normalized = normalized.replace(/(\b\w+At)\s+DATETIME\s+DEFAULT\s+''/gi, '$1 DATETIME NULL');
   }
-  console.log(`Connected to SQLite database at ${config.databasePath}`);
-  db.run('PRAGMA journal_mode=WAL');
-  db.run('PRAGMA foreign_keys=ON');
-  initializeDatabase();
-});
+  normalized = normalized.replace(/INSERT\s+OR\s+IGNORE\s+INTO/gi, 'INSERT IGNORE INTO');
+  normalized = normalized.replace(
+    /ON\s+CONFLICT\s*\(\s*settingKey\s*\)\s*DO\s+UPDATE\s+SET\s+value\s*=\s*excluded\.value\s*,\s*updatedAt\s*=\s*CURRENT_TIMESTAMP/gi,
+    'ON DUPLICATE KEY UPDATE value = VALUES(value), updatedAt = CURRENT_TIMESTAMP'
+  );
+  normalized = normalized.replace(
+    /ON\s+CONFLICT\s*\(\s*section\s*,\s*contentKey\s*\)\s*DO\s+UPDATE\s+SET\s+value\s*=\s*excluded\.value\s*,\s*type\s*=\s*excluded\.type\s*,\s*updatedAt\s*=\s*CURRENT_TIMESTAMP\s*,\s*updatedBy\s*=\s*excluded\.updatedBy/gi,
+    'ON DUPLICATE KEY UPDATE value = VALUES(value), type = VALUES(type), updatedAt = CURRENT_TIMESTAMP, updatedBy = VALUES(updatedBy)'
+  );
+  normalized = normalized.replace(/DATE\('now'\)/gi, 'CURDATE()');
+  return normalized;
+}
 
-// Promise wrappers for SQLite
-const dbRun = (sql, params = []) => new Promise((resolve, reject) => {
-  db.run(sql, params, function (err) {
-    if (err) reject(err);
-    else resolve({ lastID: this.lastID, changes: this.changes });
+const dbRun = async (sql, params = []) => {
+  const query = normalizeSql(sql);
+  if (isMySql) {
+    const [result] = await mysqlPool.execute(query, params);
+    return { lastID: result.insertId || 0, changes: result.affectedRows || 0 };
+  }
+  return new Promise((resolve, reject) => {
+    db.run(query, params, function (err) {
+      if (err) reject(err);
+      else resolve({ lastID: this.lastID, changes: this.changes });
+    });
   });
-});
+};
 
-const dbGet = (sql, params = []) => new Promise((resolve, reject) => {
-  db.get(sql, params, (err, row) => {
-    if (err) reject(err);
-    else resolve(row);
+const dbGet = async (sql, params = []) => {
+  const query = normalizeSql(sql);
+  if (isMySql) {
+    const [rows] = await mysqlPool.execute(query, params);
+    return rows?.[0] || null;
+  }
+  return new Promise((resolve, reject) => {
+    db.get(query, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(row || null);
+    });
   });
-});
+};
 
-const dbAll = (sql, params = []) => new Promise((resolve, reject) => {
-  db.all(sql, params, (err, rows) => {
-    if (err) reject(err);
-    else resolve(rows || []);
+const dbAll = async (sql, params = []) => {
+  const query = normalizeSql(sql);
+  if (isMySql) {
+    const [rows] = await mysqlPool.execute(query, params);
+    return rows || [];
+  }
+  return new Promise((resolve, reject) => {
+    db.all(query, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows || []);
+    });
   });
-});
+};
 
-function initializeDatabase() {
-  db.serialize(() => {
+async function runSchema(sql, { ignoreErrors = [] } = {}) {
+  try {
+    await dbRun(sql);
+  } catch (err) {
+    const message = String(err?.message || '').toLowerCase();
+    const shouldIgnore = ignoreErrors.some((needle) => message.includes(needle));
+    if (!shouldIgnore) {
+      throw err;
+    }
+  }
+}
+
+async function initializeDatabase() {
+  try {
     // Users table
-    db.run(`
+    await runSchema(`
       CREATE TABLE IF NOT EXISTS users (
         id TEXT PRIMARY KEY,
         email TEXT UNIQUE NOT NULL,
@@ -230,21 +280,37 @@ function initializeDatabase() {
     `);
 
     // Add profileImage column if upgrading existing database
-    db.run(`ALTER TABLE users ADD COLUMN profileImage TEXT DEFAULT ''`, () => {});
+    await runSchema(`ALTER TABLE users ADD COLUMN profileImage TEXT DEFAULT ''`, {
+      ignoreErrors: ['duplicate column', 'duplicate column name', 'already exists'],
+    });
 
     // New columns for settings features
-    db.run(`ALTER TABLE users ADD COLUMN twoFactorSecret TEXT DEFAULT ''`, () => {});
-    db.run(`ALTER TABLE users ADD COLUMN twoFactorEnabled INTEGER DEFAULT 0`, () => {});
-    db.run(`ALTER TABLE users ADD COLUMN passwordChangedAt TEXT DEFAULT ''`, () => {});
-    db.run(`ALTER TABLE users ADD COLUMN notificationPrefs TEXT DEFAULT '{}'`, () => {});
-    db.run(`ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'en'`, () => {});
-    db.run(`ALTER TABLE users ADD COLUMN timezone TEXT DEFAULT 'UTC'`, () => {});
+    await runSchema(`ALTER TABLE users ADD COLUMN twoFactorSecret TEXT DEFAULT ''`, {
+      ignoreErrors: ['duplicate column', 'duplicate column name', 'already exists'],
+    });
+    await runSchema(`ALTER TABLE users ADD COLUMN twoFactorEnabled INTEGER DEFAULT 0`, {
+      ignoreErrors: ['duplicate column', 'duplicate column name', 'already exists'],
+    });
+    await runSchema(`ALTER TABLE users ADD COLUMN passwordChangedAt TEXT DEFAULT ''`, {
+      ignoreErrors: ['duplicate column', 'duplicate column name', 'already exists'],
+    });
+    await runSchema(`ALTER TABLE users ADD COLUMN notificationPrefs TEXT DEFAULT '{}'`, {
+      ignoreErrors: ['duplicate column', 'duplicate column name', 'already exists'],
+    });
+    await runSchema(`ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'en'`, {
+      ignoreErrors: ['duplicate column', 'duplicate column name', 'already exists'],
+    });
+    await runSchema(`ALTER TABLE users ADD COLUMN timezone TEXT DEFAULT 'UTC'`, {
+      ignoreErrors: ['duplicate column', 'duplicate column name', 'already exists'],
+    });
 
     // Add image column to cryptocurrencies for existing databases
-    db.run(`ALTER TABLE cryptocurrencies ADD COLUMN image TEXT DEFAULT ''`, () => {});
+    await runSchema(`ALTER TABLE cryptocurrencies ADD COLUMN image TEXT DEFAULT ''`, {
+      ignoreErrors: ['duplicate column', 'duplicate column name', 'already exists', 'no such table', "doesn't exist"],
+    });
 
     // Login sessions table
-    db.run(`
+    await runSchema(`
       CREATE TABLE IF NOT EXISTS login_sessions (
         id TEXT PRIMARY KEY,
         userId TEXT NOT NULL,
@@ -261,7 +327,7 @@ function initializeDatabase() {
     `);
 
     // Orders table
-    db.run(`
+    await runSchema(`
       CREATE TABLE IF NOT EXISTS orders (
         id TEXT PRIMARY KEY,
         userId TEXT NOT NULL,
@@ -285,7 +351,7 @@ function initializeDatabase() {
     `);
 
     // Wallets table
-    db.run(`
+    await runSchema(`
       CREATE TABLE IF NOT EXISTS wallets (
         id TEXT PRIMARY KEY,
         userId TEXT UNIQUE NOT NULL,
@@ -304,7 +370,7 @@ function initializeDatabase() {
     `);
 
     // Cryptocurrencies table
-    db.run(`
+    await runSchema(`
       CREATE TABLE IF NOT EXISTS cryptocurrencies (
         id TEXT PRIMARY KEY,
         symbol TEXT UNIQUE NOT NULL,
@@ -324,7 +390,7 @@ function initializeDatabase() {
     `);
 
     // Payment methods table
-    db.run(`
+    await runSchema(`
       CREATE TABLE IF NOT EXISTS payment_methods (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -343,7 +409,7 @@ function initializeDatabase() {
     `);
 
     // Activity log table (audit trail)
-    db.run(`
+    await runSchema(`
       CREATE TABLE IF NOT EXISTS activity_log (
         id TEXT PRIMARY KEY,
         userId TEXT,
@@ -355,7 +421,7 @@ function initializeDatabase() {
     `);
 
     // Notifications table
-    db.run(`
+    await runSchema(`
       CREATE TABLE IF NOT EXISTS notifications (
         id TEXT PRIMARY KEY,
         userId TEXT NOT NULL,
@@ -369,7 +435,7 @@ function initializeDatabase() {
     `);
 
     // Reviews table
-    db.run(`
+    await runSchema(`
       CREATE TABLE IF NOT EXISTS reviews (
         id TEXT PRIMARY KEY,
         userId TEXT NOT NULL,
@@ -383,7 +449,7 @@ function initializeDatabase() {
     `);
 
     // Support tickets table
-    db.run(`
+    await runSchema(`
       CREATE TABLE IF NOT EXISTS support_tickets (
         id TEXT PRIMARY KEY,
         userId TEXT NOT NULL,
@@ -398,7 +464,7 @@ function initializeDatabase() {
     `);
 
     // Ticket messages table
-    db.run(`
+    await runSchema(`
       CREATE TABLE IF NOT EXISTS ticket_messages (
         id TEXT PRIMARY KEY,
         ticketId TEXT NOT NULL,
@@ -412,32 +478,68 @@ function initializeDatabase() {
     `);
 
     // Site content table — CMS for homepage sections
-    db.run(`
+    await runSchema(`
       CREATE TABLE IF NOT EXISTS site_content (
         id TEXT PRIMARY KEY,
         section TEXT NOT NULL,
-        key TEXT NOT NULL,
+        contentKey TEXT NOT NULL,
         value TEXT NOT NULL DEFAULT '',
         type TEXT NOT NULL DEFAULT 'text',
         updatedAt TEXT DEFAULT CURRENT_TIMESTAMP,
         updatedBy TEXT,
-        UNIQUE(section, key)
+        UNIQUE(section, contentKey)
       )
     `);
 
     // App settings table (SMTP, feature toggles, etc.)
-    db.run(`
+    await runSchema(`
       CREATE TABLE IF NOT EXISTS app_settings (
-        key TEXT PRIMARY KEY,
+        settingKey TEXT PRIMARY KEY,
         value TEXT NOT NULL DEFAULT '',
         updatedAt TEXT DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
     // Seed default data
-    seedDefaultData();
-  });
+    await seedDefaultData();
+  } catch (err) {
+    console.error('Database initialization error:', err);
+    process.exit(1);
+  }
 }
+
+async function startDatabase() {
+  try {
+    if (isMySql) {
+      mysqlPool = mysql.createPool({
+        uri: config.databaseUrl,
+        waitForConnections: true,
+        connectionLimit: 10,
+        queueLimit: 0,
+      });
+      await mysqlPool.query('SELECT 1');
+      console.log('Connected to MySQL database');
+      await initializeDatabase();
+      return;
+    }
+
+    db = new sqlite3.Database(config.databasePath, (err) => {
+      if (err) {
+        console.error('Database connection error:', err);
+        process.exit(1);
+      }
+      console.log(`Connected to SQLite database at ${config.databasePath}`);
+      db.run('PRAGMA journal_mode=WAL');
+      db.run('PRAGMA foreign_keys=ON');
+      initializeDatabase();
+    });
+  } catch (err) {
+    console.error('Database startup error:', err);
+    process.exit(1);
+  }
+}
+
+startDatabase();
 
 async function seedDefaultData() {
   try {
@@ -576,7 +678,7 @@ async function createNotification(userId, title, message, type = 'info') {
 
 async function getSetting(key, defaultValue = '') {
   try {
-    const row = await dbGet('SELECT value FROM app_settings WHERE key = ?', [key]);
+    const row = await dbGet('SELECT value FROM app_settings WHERE settingKey = ?', [key]);
     return row ? row.value : defaultValue;
   } catch (e) {
     return defaultValue;
@@ -585,7 +687,7 @@ async function getSetting(key, defaultValue = '') {
 
 async function setSetting(key, value) {
   await dbRun(
-    'INSERT INTO app_settings (key, value, updatedAt) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updatedAt = CURRENT_TIMESTAMP',
+    'INSERT INTO app_settings (settingKey, value, updatedAt) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(settingKey) DO UPDATE SET value = excluded.value, updatedAt = CURRENT_TIMESTAMP',
     [key, String(value)]
   );
 }
@@ -2705,7 +2807,7 @@ app.post('/api/admin/broadcast/send', authenticate, loadUser, requireAdmin, asyn
 // Get all admin settings
 app.get('/api/admin/settings', authenticate, loadUser, requireAdmin, async (req, res) => {
   try {
-    const rows = await dbAll('SELECT key, value, updatedAt FROM app_settings');
+    const rows = await dbAll('SELECT settingKey AS `key`, value, updatedAt FROM app_settings');
     const settings = {};
     for (const row of rows) {
       settings[row.key] = row.value;
@@ -2843,7 +2945,7 @@ app.put('/api/admin/settings/features', authenticate, loadUser, requireAdmin, as
 // Public — get all published site content
 app.get('/api/site-content', async (req, res) => {
   try {
-    const rows = await dbAll('SELECT section, key, value, type FROM site_content');
+    const rows = await dbAll('SELECT section, contentKey AS `key`, value, type FROM site_content');
     // Group by section
     const content = {};
     for (const row of rows) {
@@ -2866,7 +2968,7 @@ app.get('/api/site-content', async (req, res) => {
 // Admin — get all site content (with metadata)
 app.get('/api/admin/site-content', authenticate, loadUser, requireAdmin, async (req, res) => {
   try {
-    const rows = await dbAll('SELECT * FROM site_content ORDER BY section, key');
+    const rows = await dbAll('SELECT id, section, contentKey AS `key`, value, type, updatedAt, updatedBy FROM site_content ORDER BY section, contentKey');
     res.json({ data: rows });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch site content' });
@@ -2889,9 +2991,9 @@ app.put('/api/admin/site-content', authenticate, loadUser, requireAdmin, async (
       const stringValue = type === 'json' ? JSON.stringify(value) : String(value || '');
 
       await dbRun(`
-        INSERT INTO site_content (id, section, key, value, type, updatedAt, updatedBy)
+        INSERT INTO site_content (id, section, contentKey, value, type, updatedAt, updatedBy)
         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-        ON CONFLICT(section, key) DO UPDATE SET
+        ON CONFLICT(section, contentKey) DO UPDATE SET
           value = excluded.value,
           type = excluded.type,
           updatedAt = CURRENT_TIMESTAMP,
@@ -2910,7 +3012,7 @@ app.put('/api/admin/site-content', authenticate, loadUser, requireAdmin, async (
 app.delete('/api/admin/site-content/:section/:key', authenticate, loadUser, requireAdmin, async (req, res) => {
   try {
     const { section, key } = req.params;
-    await dbRun('DELETE FROM site_content WHERE section = ? AND key = ?', [section, key]);
+    await dbRun('DELETE FROM site_content WHERE section = ? AND contentKey = ?', [section, key]);
     res.json({ data: { message: 'Content entry deleted' } });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete content' });
