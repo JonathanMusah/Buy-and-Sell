@@ -20,6 +20,7 @@ const UAParser = require('ua-parser-js');
 const config = {
   port: process.env.PORT || 5000,
   env: process.env.NODE_ENV || 'development',
+  databasePath: process.env.DATABASE_PATH || './database.sqlite',
   jwt: {
     secret: process.env.JWT_SECRET || 'dev-secret-change-me',
     refreshSecret: process.env.JWT_REFRESH_SECRET || 'dev-refresh-secret-change-me',
@@ -167,12 +168,12 @@ const upload = multer({
 });
 
 // ============= DATABASE =============
-const db = new sqlite3.Database('./database.sqlite', (err) => {
+const db = new sqlite3.Database(config.databasePath, (err) => {
   if (err) {
     console.error('Database connection error:', err);
     process.exit(1);
   }
-  console.log('Connected to SQLite database');
+  console.log(`Connected to SQLite database at ${config.databasePath}`);
   db.run('PRAGMA journal_mode=WAL');
   db.run('PRAGMA foreign_keys=ON');
   initializeDatabase();
