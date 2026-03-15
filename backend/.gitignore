@@ -1,0 +1,22 @@
+# Environment
+.env
+.env.local
+.env.production
+
+# Database
+*.sqlite
+database.sqlite
+
+# Uploads
+uploads/
+
+# Dependencies
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
