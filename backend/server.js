@@ -70,7 +70,9 @@ app.use(cors({
     ];
     // Also auto-allow any 192.168.x.x or 10.x.x.x origin on common dev ports
     const isLan = /^https?:\/\/(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)/.test(origin);
-    if (allowed.includes(origin) || isLan) {
+    // Allow Vercel preview deployments for the project owner
+    const isVercelPreview = /^https:\/\/[a-z0-9-]+-jonathanmusahs-projects\.vercel\.app$/.test(origin);
+    if (allowed.includes(origin) || isLan || isVercelPreview) {
       return callback(null, true);
     }
     // In development, allow all origins
